@@ -1,4 +1,6 @@
 .env
+.riolu-state.json
+.riolu-state.json.tmp
 .venv/
 __pycache__/
 *.py[cod]
