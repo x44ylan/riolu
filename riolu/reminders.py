@@ -12,6 +12,18 @@ class ReminderRequest:
     text: str
 
 
+def parse_daily_request(value: str, *, now: datetime, timezone: ZoneInfo) -> ReminderRequest:
+    match = re.match(r"^(\d{1,2}:\d{2})\s+(.+)$", value.strip())
+    if match is None:
+        raise ValueError("Use /daily HH:MM <task>.")
+    hour, minute = _split_time(match.group(1))
+    local_now = now.astimezone(timezone)
+    due_at = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if due_at <= local_now:
+        due_at += timedelta(days=1)
+    return ReminderRequest(due_at=due_at, text=match.group(2).strip())
+
+
 def parse_reminder_request(value: str, *, now: datetime, timezone: ZoneInfo) -> ReminderRequest:
     text = value.strip()
     if not text:

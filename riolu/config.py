@@ -30,7 +30,7 @@ def load_settings() -> Settings:
     if not token:
         raise RuntimeError("TELEGRAM_TOKEN is required")
 
-    max_limit = max(1, _int_env("MAX_LIMIT", 10))
+    max_limit = max(1, _int_env("MAX_LIMIT", 100))
     return Settings(
         telegram_token=token,
         allowed_chat_ids=frozenset(_int_list_env("ALLOWED_CHAT_IDS")),

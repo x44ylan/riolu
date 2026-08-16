@@ -13,6 +13,7 @@ class IntelItem:
     summary: str = ""
     category: str = "general"
     tags: tuple[str, ...] = ()
+    facts: tuple[str, ...] = ()
     published_at: datetime | None = None
 
     @property

@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Any
 
 import httpx
+
+
+LOGGER = logging.getLogger(__name__)
+MAX_REQUEST_ATTEMPTS = 3
 
 
 class TelegramAPI:
@@ -76,13 +82,55 @@ class TelegramAPI:
     async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
         await self.request("sendChatAction", {"chat_id": chat_id, "action": action})
 
+    async def delete_messages(self, chat_id: int, message_ids: list[int]) -> None:
+        for start in range(0, len(message_ids), 100):
+            await self.request(
+                "deleteMessages",
+                {"chat_id": chat_id, "message_ids": message_ids[start : start + 100]},
+            )
+
     async def request(self, method: str, payload: dict[str, Any]) -> Any:
-        response = await self.client.post(self._url(method), json=payload)
-        response.raise_for_status()
-        data = response.json()
-        if not data.get("ok"):
-            raise RuntimeError(data.get("description", "Telegram request failed"))
-        return data.get("result")
+        for attempt in range(MAX_REQUEST_ATTEMPTS):
+            try:
+                response = await self.client.post(self._url(method), json=payload)
+            except httpx.TransportError:
+                if attempt + 1 >= MAX_REQUEST_ATTEMPTS:
+                    raise
+                await asyncio.sleep(2**attempt)
+                continue
+
+            status = int(getattr(response, "status_code", 200))
+            try:
+                parsed = response.json()
+            except ValueError:
+                parsed = {}
+            data = parsed if isinstance(parsed, dict) else {}
+            retry_after = _retry_after(data)
+            retryable = status == 429 or status >= 500 or retry_after is not None
+            if retryable and attempt + 1 < MAX_REQUEST_ATTEMPTS:
+                delay = min(60, retry_after if retry_after is not None else 2**attempt)
+                LOGGER.warning("Telegram %s retrying in %ss after status %s", method, delay, status)
+                await asyncio.sleep(delay)
+                continue
+
+            response.raise_for_status()
+            if not data.get("ok"):
+                raise RuntimeError(data.get("description", "Telegram request failed"))
+            return data.get("result")
+        raise RuntimeError("Telegram request retry budget exhausted")
 
     def _url(self, method: str) -> str:
         return f"https://api.telegram.org/bot{self.token}/{method}"
+
+
+def _retry_after(data: object) -> int | None:
+    if not isinstance(data, dict):
+        return None
+    parameters = data.get("parameters")
+    if not isinstance(parameters, dict):
+        return None
+    try:
+        value = int(parameters.get("retry_after"))
+    except (TypeError, ValueError):
+        return None
+    return max(0, value)

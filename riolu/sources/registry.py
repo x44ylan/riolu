@@ -5,8 +5,7 @@ from dataclasses import dataclass
 from riolu.sources.base import Source, matches_source_token, normalize_source_token
 from riolu.sources.cyber_news import SOURCE as CYBER_NEWS
 from riolu.sources.hello_github import SOURCE as HELLO_GITHUB
-from riolu.sources.lol_esports import SOURCE as LOL_ESPORTS
-from riolu.sources.opencode_releases import SOURCE as OPENCODE_RELEASES
+from riolu.sources.onetracker import SOURCE as ONETRACKER
 from riolu.sources.talkback import SOURCE as TALKBACK
 from riolu.sources.tech_learning import SOURCE as TECH_LEARNING
 
@@ -14,8 +13,7 @@ from riolu.sources.tech_learning import SOURCE as TECH_LEARNING
 BUILTIN_SOURCES: tuple[Source, ...] = (
     HELLO_GITHUB,
     TALKBACK,
-    LOL_ESPORTS,
-    OPENCODE_RELEASES,
+    ONETRACKER,
     CYBER_NEWS,
     TECH_LEARNING,
 )

@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import unittest
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 from riolu.telegram import TelegramAPI
 
 
 class _FakeResponse:
-    def __init__(self, result: object) -> None:
+    def __init__(self, result: object, *, status_code: int = 200) -> None:
         self._result = result
+        self.status_code = status_code
 
     def raise_for_status(self) -> None:
         return None
@@ -30,6 +32,24 @@ class _FakeClient:
         if url.endswith("/getUpdates"):
             return _FakeResponse([])
         return _FakeResponse(True)
+
+
+class _RetryClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def post(self, url: str, *, json: dict[str, Any]) -> _FakeResponse:
+        self.calls += 1
+        if self.calls == 1:
+            response = _FakeResponse(False, status_code=429)
+            response.json = lambda: {
+                "ok": False,
+                "error_code": 429,
+                "description": "Too Many Requests",
+                "parameters": {"retry_after": 2},
+            }
+            return response
+        return _FakeResponse({"message_id": 7})
 
 
 class TelegramAPITests(unittest.IsolatedAsyncioTestCase):
@@ -63,3 +83,25 @@ class TelegramAPITests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(client.calls[0][0].endswith("/setMyCommands"))
         self.assertEqual(client.calls[0][1]["commands"], list(commands))
+
+    async def test_message_history_deletion_is_batched(self) -> None:
+        client = _FakeClient()
+        api = TelegramAPI("token", client)  # type: ignore[arg-type]
+
+        await api.delete_messages(7, list(range(1, 151)))
+
+        self.assertEqual(len(client.calls), 2)
+        self.assertTrue(all(call[0].endswith("/deleteMessages") for call in client.calls))
+        self.assertEqual(len(client.calls[0][1]["message_ids"]), 100)
+        self.assertEqual(len(client.calls[1][1]["message_ids"]), 50)
+
+    async def test_rate_limit_is_retried_using_telegram_delay(self) -> None:
+        client = _RetryClient()
+        api = TelegramAPI("token", client)  # type: ignore[arg-type]
+
+        with patch("riolu.telegram.asyncio.sleep", new=AsyncMock()) as sleep:
+            sent = await api.send_message(7, "Hello")
+
+        self.assertEqual(sent["message_id"], 7)
+        self.assertEqual(client.calls, 2)
+        sleep.assert_awaited_once_with(2)

@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from riolu.reminders import parse_reminder_request
+from riolu.reminders import parse_daily_request, parse_reminder_request
 
 
 class ReminderParsingTests(unittest.TestCase):
@@ -34,6 +34,12 @@ class ReminderParsingTests(unittest.TestCase):
     def test_rejects_zero_delay(self) -> None:
         with self.assertRaisesRegex(ValueError, "future"):
             parse_reminder_request("in 0m Immediately", now=self.now, timezone=self.timezone)
+
+    def test_daily_task_rolls_to_next_occurrence(self) -> None:
+        request = parse_daily_request("09:00 Exercise", now=self.now, timezone=self.timezone)
+
+        self.assertEqual(request.due_at, datetime(2026, 7, 11, 9, 0, tzinfo=self.timezone))
+        self.assertEqual(request.text, "Exercise")
 
 
 if __name__ == "__main__":

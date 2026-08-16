@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +57,63 @@ class StateStore:
                     continue
             return chat_ids
 
+    async def remember_message(self, chat_id: int, message_id: int) -> None:
+        if message_id <= 0:
+            return
+        async with self._lock:
+            data = self._load()
+            values = data["messages"].setdefault(str(chat_id), [])
+            if message_id not in values:
+                values.append(message_id)
+                data["messages"][str(chat_id)] = values[-100:]
+                self._save(data)
+
+    async def take_message_history(self, chat_id: int) -> list[int]:
+        async with self._lock:
+            data = self._load()
+            values = data["messages"].pop(str(chat_id), [])
+            if values:
+                self._save(data)
+            return [value for value in values if isinstance(value, int) and value > 0]
+
+    async def cart_for_chat(self, chat_id: int) -> list[dict[str, Any]]:
+        async with self._lock:
+            data = self._load()
+            return list(data["cart"].get(str(chat_id), []))
+
+    async def add_cart_item(self, chat_id: int, text: str) -> dict[str, Any]:
+        clean = " ".join(text.split()).strip()[:500]
+        if not clean:
+            raise ValueError("Cart item cannot be empty.")
+        async with self._lock:
+            data = self._load()
+            values = data["cart"].setdefault(str(chat_id), [])
+            existing = next(
+                (value for value in values if str(value.get("text", "")).casefold() == clean.casefold()),
+                None,
+            )
+            if existing is not None:
+                return dict(existing)
+            value = {
+                "id": _stable_id("cart", f"{chat_id}:{clean.casefold()}"),
+                "text": clean,
+                "created_at": _now_iso(),
+            }
+            values.append(value)
+            self._save(data)
+            return dict(value)
+
+    async def remove_cart_item(self, chat_id: int, item_id: str) -> dict[str, Any] | None:
+        async with self._lock:
+            data = self._load()
+            values = data["cart"].setdefault(str(chat_id), [])
+            for index, value in enumerate(values):
+                if str(value.get("id", "")) == item_id:
+                    removed = values.pop(index)
+                    self._save(data)
+                    return removed
+            return None
+
     async def add_subscription(self, chat_id: int, url: str, title: str) -> dict[str, Any]:
         async with self._lock:
             data = self._load()
@@ -70,6 +127,8 @@ class StateStore:
                 "id": _stable_id("rss", f"{chat_id}:{url}"),
                 "title": title,
                 "url": url,
+                "paused": False,
+                "keywords": [],
                 "created_at": _now_iso(),
             }
             subscriptions.append(subscription)
@@ -98,12 +157,51 @@ class StateStore:
             data = self._load()
             return list(data["subscriptions"].get(str(chat_id), []))
 
+    async def set_subscription_paused(
+        self,
+        chat_id: int,
+        token: str,
+        paused: bool,
+    ) -> dict[str, Any] | None:
+        return await self._update_subscription(chat_id, token, paused=paused)
+
+    async def set_subscription_keywords(
+        self,
+        chat_id: int,
+        token: str,
+        keywords: list[str],
+    ) -> dict[str, Any] | None:
+        normalized = sorted({keyword.strip().casefold() for keyword in keywords if keyword.strip()})[:20]
+        return await self._update_subscription(chat_id, token, keywords=normalized)
+
+    async def _update_subscription(
+        self,
+        chat_id: int,
+        token: str,
+        **changes: object,
+    ) -> dict[str, Any] | None:
+        async with self._lock:
+            data = self._load()
+            subscriptions = data["subscriptions"].setdefault(str(chat_id), [])
+            normalized = token.strip().casefold()
+            for subscription in subscriptions:
+                identities = {
+                    str(subscription.get("id", "")).casefold(),
+                    str(subscription.get("url", "")).casefold(),
+                }
+                if normalized not in identities:
+                    continue
+                subscription.update(changes)
+                self._save(data)
+                return dict(subscription)
+            return None
+
     async def subscription_chat_ids(self) -> set[int]:
         async with self._lock:
             data = self._load()
             chat_ids: set[int] = set()
             for key, subscriptions in data["subscriptions"].items():
-                if not subscriptions:
+                if not any(not item.get("paused", False) for item in subscriptions):
                     continue
                 try:
                     chat_ids.add(int(key))
@@ -111,7 +209,14 @@ class StateStore:
                     continue
             return chat_ids
 
-    async def add_reminder(self, chat_id: int, text: str, due_at: datetime) -> dict[str, Any]:
+    async def add_reminder(
+        self,
+        chat_id: int,
+        text: str,
+        due_at: datetime,
+        *,
+        repeat: str = "",
+    ) -> dict[str, Any]:
         async with self._lock:
             data = self._load()
             reminder = {
@@ -121,6 +226,8 @@ class StateStore:
                 "due_at": due_at.isoformat(),
                 "created_at": _now_iso(),
             }
+            if repeat == "daily":
+                reminder["repeat"] = "daily"
             data["reminders"].append(reminder)
             data["reminders"].sort(key=lambda item: item.get("due_at", ""))
             self._save(data)
@@ -161,6 +268,25 @@ class StateStore:
             data["reminders"] = [item for item in data["reminders"] if item.get("id") != reminder_id]
             self._save(data)
 
+    async def reschedule_daily_reminder(self, reminder_id: str, now: datetime) -> None:
+        async with self._lock:
+            data = self._load()
+            for reminder in data["reminders"]:
+                if reminder.get("id") != reminder_id or reminder.get("repeat") != "daily":
+                    continue
+                due_at = _parse_datetime(str(reminder.get("due_at", "")))
+                if due_at is None:
+                    return
+                if due_at.tzinfo is None and now.tzinfo is not None:
+                    due_at = due_at.replace(tzinfo=now.tzinfo)
+                while due_at <= now:
+                    due_at += timedelta(days=1)
+                reminder["due_at"] = due_at.isoformat()
+                reminder["last_sent_at"] = now.isoformat()
+                data["reminders"].sort(key=lambda item: item.get("due_at", ""))
+                self._save(data)
+                return
+
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
             return _empty_state()
@@ -183,7 +309,15 @@ class StateStore:
 
 
 def _empty_state() -> dict[str, Any]:
-    return {"version": 2, "seen": {}, "subscriptions": {}, "reminders": [], "chats": []}
+    return {
+        "version": 2,
+        "seen": {},
+        "subscriptions": {},
+        "reminders": [],
+        "cart": {},
+        "messages": {},
+        "chats": [],
+    }
 
 
 def _normalize_state(raw: dict[str, Any]) -> dict[str, Any]:
@@ -199,7 +333,7 @@ def _normalize_state(raw: dict[str, Any]) -> dict[str, Any]:
     subscriptions = raw.get("subscriptions")
     if isinstance(subscriptions, dict):
         state["subscriptions"] = {
-            str(chat_id): [dict(item) for item in items if isinstance(item, dict)]
+            str(chat_id): [_normalize_subscription(item) for item in items if isinstance(item, dict)]
             for chat_id, items in subscriptions.items()
             if isinstance(items, list)
         }
@@ -208,11 +342,48 @@ def _normalize_state(raw: dict[str, Any]) -> dict[str, Any]:
     if isinstance(reminders, list):
         state["reminders"] = _normalize_reminders(reminders)
 
+    cart = raw.get("cart")
+    if isinstance(cart, dict):
+        state["cart"] = {
+            str(chat_id): [_normalize_cart_item(item) for item in items if isinstance(item, dict)]
+            for chat_id, items in cart.items()
+            if isinstance(items, list)
+        }
+
+    messages = raw.get("messages")
+    if isinstance(messages, dict):
+        state["messages"] = {
+            str(chat_id): [value for value in values if isinstance(value, int) and value > 0][-100:]
+            for chat_id, values in messages.items()
+            if isinstance(values, list)
+        }
+
     chats = raw.get("chats")
     if isinstance(chats, list):
         state["chats"] = [item for item in chats if isinstance(item, (int, str))]
 
     return state
+
+
+def _normalize_subscription(item: dict[object, object]) -> dict[str, Any]:
+    subscription = {str(key): value for key, value in item.items()}
+    keywords = subscription.get("keywords", [])
+    if not isinstance(keywords, list):
+        keywords = []
+    subscription["keywords"] = [
+        str(keyword).strip().casefold()
+        for keyword in keywords
+        if isinstance(keyword, str) and keyword.strip()
+    ][:20]
+    subscription["paused"] = bool(subscription.get("paused", False))
+    return subscription
+
+
+def _normalize_cart_item(item: dict[object, object]) -> dict[str, Any]:
+    value = {str(key): raw for key, raw in item.items()}
+    value["id"] = str(value.get("id", ""))[:80]
+    value["text"] = " ".join(str(value.get("text", "Cart item")).split())[:500]
+    return value
 
 
 def _normalize_seen(raw: dict[object, object]) -> dict[str, dict[str, list[str]]]:
@@ -249,6 +420,10 @@ def _normalize_reminders(raw: list[object]) -> list[dict[str, Any]]:
             text=str(item.get("text") or "Reminder"),
             due_at=due_at,
         )
+        if item.get("repeat") == "daily":
+            reminder["repeat"] = "daily"
+        else:
+            reminder.pop("repeat", None)
         reminders.append(reminder)
     return reminders
 
