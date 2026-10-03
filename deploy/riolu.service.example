@@ -1,0 +1,23 @@
+[Unit]
+Description=Riolu Telegram assistant
+After=network-online.target riolu-agent.service
+Wants=network-online.target riolu-agent.service
+
+[Service]
+Type=simple
+User=riolu
+Group=riolu
+WorkingDirectory=/opt/riolu
+EnvironmentFile=/etc/riolu/secrets.env
+Environment=RIOLU_CONFIG_DIR=/etc/riolu
+ExecStart=/opt/riolu/.venv/bin/riolu
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/riolu
+
+[Install]
+WantedBy=multi-user.target

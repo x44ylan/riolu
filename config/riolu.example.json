@@ -1,0 +1,22 @@
+{
+  "state_path": ".riolu-state.json",
+  "http_timeout_seconds": 20,
+  "limits": {
+    "default": 5,
+    "maximum": 100
+  },
+  "schedule": {
+    "timezone": "UTC",
+    "hour": 8
+  },
+  "telegram": {
+    "allowed_chat_ids": [],
+    "target_chat_id": null,
+    "daily_news_chat_id": null,
+    "daily_news_thread_id": null
+  },
+  "agent": {
+    "chat_ids": [],
+    "workspace": "/path/to/workspace"
+  }
+}

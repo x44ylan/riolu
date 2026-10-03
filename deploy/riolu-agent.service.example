@@ -1,0 +1,23 @@
+[Unit]
+Description=Riolu OpenCode agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=riolu
+Group=riolu
+WorkingDirectory=/opt/riolu
+EnvironmentFile=/etc/riolu/secrets.env
+Environment=RIOLU_CONFIG_DIR=/etc/riolu
+ExecStart=/opt/riolu/.venv/bin/riolu-agent
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/riolu
+
+[Install]
+WantedBy=multi-user.target

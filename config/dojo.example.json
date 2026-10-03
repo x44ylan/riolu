@@ -1,0 +1,20 @@
+{
+  "services": [
+    "riolu.service",
+    "riolu-agent.service"
+  ],
+  "tools": [
+    {
+      "name": "Dozzle",
+      "kind": "docker",
+      "target": "dozzle",
+      "port": 8080
+    },
+    {
+      "name": "OpenCode",
+      "kind": "systemd",
+      "target": "opencode.service",
+      "port": 4096
+    }
+  ]
+}
