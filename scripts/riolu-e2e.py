@@ -22,6 +22,8 @@ Source failures: aliases selecting the wrong view, option refresh losing mode,
 category limits, silent missing configured IDs, normalized configuration IDs,
 and duplicate defaults. Telegram boundaries include explicit rate limits and
 harmless repeated edits; artifacts include sensitive aliases and invalid sizes.
+Digest outage cases: retry storms, duplicate healthy-source delivery, premature
+completion, missing failure context, and secrets exposed in diagnostic output.
 All Telegram traffic and source traffic stays on disposable loopback servers.
 No production settings, state, Telegram chats, or OpenCode sessions are used.
 Run with Riolu's Python environment; RIOLU_E2E_REPORT selects the JSON artifact.
@@ -34,6 +36,7 @@ import base64
 from dataclasses import replace
 from datetime import UTC, datetime
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -48,7 +51,7 @@ from bs4 import BeautifulSoup
 
 from riolu.bot import RioluBot
 from riolu import bot as bot_module
-from riolu.config import Settings
+from riolu.config import DojoToolConfig, Settings
 from riolu.source_registry import SourceRegistry
 from riolu.telegram import TelegramAPI
 from riolu.webhook import HookServer
@@ -100,7 +103,7 @@ class Services:
             if target.startswith("/rss/"):
                 content_type, result = "application/xml", self.rss
             elif target.startswith("/news/"):
-                source = target.rsplit("/", 1)[-1]
+                source = target.split("?", 1)[0].rsplit("/", 1)[-1]
                 status = 503 if source in self.fail_sources else 200
                 result = self.feeds[source]
             elif target.startswith("/api/") and self.native_handler is not None:
@@ -445,12 +448,39 @@ async def main():
 
             async def host_menu():
                 value = bot()
+                value.dojo.inspector.tools = (
+                    DojoToolConfig('Zulu', 'systemd', 'riolu-e2e-missing.service', url=services.url + '/zulu'),
+                    DojoToolConfig('Alpha', 'systemd', 'riolu-e2e-missing.service', url=services.url + '/alpha'),
+                )
+                await update(value, "/start")
+                home = services.sent[-1][1]
+                assert all(label in home['text'] for label in ('<b>Riolu</b>', 'Uptime', 'Load', 'Memory', 'Disk')), home
+                menu = services.sent[-1][1]['reply_markup']['inline_keyboard']
+                assert any(button['text'] == 'Links' and button.get('callback_data') == 'nav:dojo' for row in menu for button in row), menu
+                assert not any(button['text'] == 'Dojo' for row in menu for button in row), menu
+                refresh = next((button for row in menu for button in row if button['text'] == '↻'), None)
+                assert refresh and refresh.get('callback_data') == 'nav:start', menu
+                await callback(value, refresh['callback_data'])
+                method, refreshed = services.calls[-1]
+                assert method == 'editMessageText' and refreshed['message_id'] == 101, refreshed
+                assert all(label in refreshed['text'] for label in ('Uptime', 'Load', 'Memory', 'Disk')), refreshed
+                await callback(value, 'nav:dojo')
+                method, payload = services.calls[-1]
+                assert method == 'editMessageText' and '<b>Links</b>' in payload['text'], payload
+                assert 'Quick links' in payload['text'], payload
+                assert not any(label in payload['text'] for label in ('Uptime', 'Load', 'Memory', 'Disk')), payload
+                buttons = [button for row in payload['reply_markup']['inline_keyboard'] for button in row]
+                assert [(button['text'], button['url']) for button in buttons if 'url' in button] == [('alpha', services.url + '/alpha'), ('zulu', services.url + '/zulu')], buttons
+                assert not any(button.get('callback_data') == 'dojo:refresh' or button['text'] in ('↻', 'Reset') for button in buttons), buttons
+                await callback(value, 'nav:start')
+                assert all(label in services.calls[-1][1]['text'] for label in ('Uptime', 'Load', 'Memory', 'Disk'))
+                assert any(button['text'] == 'Links' for row in services.calls[-1][1]['reply_markup']['inline_keyboard'] for button in row)
                 await update(value, "/dojo")
-                assert "Uptime" in services.sent[-1][1]["text"] and "Memory" in services.sent[-1][1]["text"]
+                assert '<b>Links</b>' in services.sent[-1][1]['text']
                 await callback(value, "dojo:refresh")
-                assert services.calls[-1][0] == "editMessageText" and "Disk" in services.calls[-1][1]["text"]
+                assert services.calls[-1][0] == "editMessageText" and '<b>Links</b>' in services.calls[-1][1]['text']
 
-            await check("host_inspection_and_menu_refresh", host_menu)
+            await check("home_stats_refresh_and_links_description_preserve_tool_links_and_navigation", host_menu)
 
             async def mcp_bridge(value, post, *, worker_override=False):
                 from riolu.agent import mcp as delivery
@@ -564,13 +594,109 @@ async def main():
 
             async def schedule_retry():
                 runtime = await scheduler_case(datetime(2026, 10, 3, 9, tzinfo=UTC), fail_first=True)
-                assert runtime.delays[:3] == [60, 60, 60]
-                assert runtime.checkpoints[:3] == ["", "", ""] and runtime.checkpoints[3] == "2026-10-03"
+                assert runtime.delays[:2] == [60, 60] and runtime.delays[2] > 3600
+                assert runtime.checkpoints[:2] == ["", ""] and runtime.checkpoints[2] == "2026-10-03"
 
             await check("scheduler_completed_slot_moves_to_next_day", schedule_exact_slot)
             await check("scheduler_keeps_local_hour_across_spring_dst", schedule_spring)
             await check("scheduler_keeps_local_hour_across_fall_dst", schedule_fall)
             await check("scheduler_failed_delivery_retries_before_marking_day_complete", schedule_retry)
+
+            async def outage_diagnostics():
+                value = bot()
+                await value.store.remember_chat(1)
+                services.fail_sources.add("first")
+                services.feeds["second"] = stories(1, prefix="healthy-during-outage")
+                services.feeds["first"] = stories(1, prefix="recovered-after-outage")
+                records = []
+                class Capture(logging.Handler):
+                    def emit(self, record):
+                        records.append(record)
+                handler = Capture()
+                logger = logging.getLogger("riolu")
+                previous_level = logger.level
+                logger.setLevel(logging.INFO)
+                logger.addHandler(handler)
+                class Clock:
+                    instant = datetime(2026, 10, 4, 9, tzinfo=UTC)
+                    @classmethod
+                    def now(cls, tz):
+                        return cls.instant.astimezone(tz)
+                class Runtime:
+                    CancelledError = asyncio.CancelledError
+                    def __init__(self):
+                        self.delays = []
+                        self.checkpoints = []
+                    async def sleep(self, seconds):
+                        self.delays.append(seconds)
+                        self.checkpoints.append(await value.store.digest_last_date())
+                        if len(self.delays) == 5:
+                            raise asyncio.CancelledError
+                        if len(self.delays) == 4:
+                            services.fail_sources.clear()
+                        Clock.instant = datetime.fromtimestamp(Clock.instant.timestamp() + seconds, UTC)
+                        await asyncio.sleep(0)
+                runtime = Runtime()
+                old_clock, old_runtime = bot_module.datetime, bot_module.asyncio
+                bot_module.datetime, bot_module.asyncio = Clock, runtime
+                try:
+                    try:
+                        await value._digest_loop()
+                    except asyncio.CancelledError:
+                        pass
+                finally:
+                    bot_module.datetime, bot_module.asyncio = old_clock, old_runtime
+                    logger.removeHandler(handler)
+                    logger.setLevel(previous_level)
+                assert runtime.delays[:4] == [60, 60, 120, 240], f"outage retry cadence: {runtime.delays}"
+                assert runtime.checkpoints[:4] == [""] * 4
+                assert runtime.checkpoints[4] == "2026-10-04"
+                output = "\n".join(p.get("text", "") for _, p in services.sent)
+                assert output.count("healthy-during-outage-000") == 1 and output.count("recovered-after-outage-000") == 1
+                messages = [r.getMessage() for r in records]
+                failures = [s for s in messages if "phase=fetch" in s and "error=HTTPStatusError" in s]
+                assert len(failures) == 3 and all("source=first" in s and "status=503" in s and "elapsed_ms=" in s and "host=127.0.0.1" in s for s in failures), failures
+                assert any("retry_in=240" in s and "sources=first" in s for s in messages), messages
+                assert any("fetched=1" in s and "fresh=0" in s and "source=second" in s for s in messages)
+                assert any("Digest completed" in s for s in messages)
+                assert not any(r.exc_info for r in records), "expected outages dumped redundant tracebacks"
+
+            await check("digest_outage_backoff_context_and_recovery_without_duplicates", outage_diagnostics)
+
+            async def safe_manual_diagnostics():
+                sensitive = Path(root) / "sensitive-source"
+                sensitive.mkdir()
+                secret_url = services.url + "/news/first?api_key=fixture-secret&question=private-content"
+                (sensitive / "first.py").write_text(
+                    "class FixtureSource:\n    id = 'first'\n    name = 'First'\n    category = 'news'\n"
+                    "    description = 'fixture'\n    aliases = ()\n"
+                    "    async def fetch(self, limit, client):\n"
+                    f"        response = await client.get({secret_url!r}); response.raise_for_status()\n"
+                    "SOURCE = FixtureSource()\n"
+                )
+                value = bot(sources=SourceRegistry.load(str(sensitive)))
+                services.fail_sources.add("first")
+                records = []
+                class Capture(logging.Handler):
+                    def emit(self, record):
+                        records.append(record)
+                logger = logging.getLogger("riolu")
+                handler = Capture()
+                logger.addHandler(handler)
+                try:
+                    await update(value, "/first")
+                    try:
+                        await value._post_new_items(1, value.registry.all())
+                    except RuntimeError:
+                        pass
+                finally:
+                    logger.removeHandler(handler)
+                messages = "\n".join(record.getMessage() for record in records)
+                assert "phase=fetch" in messages and "command=source" in messages and "status=503" in messages, messages
+                assert "fixture-secret" not in messages and "private-content" not in messages and "api_key" not in messages
+                assert not any(record.exc_info for record in records)
+
+            await check("manual_and_scheduled_source_logs_hide_sensitive_url_data", safe_manual_diagnostics)
 
             async def long_output(mode):
                 process = await asyncio.create_subprocess_exec(sys.executable, __file__, "--render-probe", mode,

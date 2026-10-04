@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from collections.abc import Callable
 
 import httpx
 
 from riolu.config import Settings
+from riolu.diagnostics import error_context
 from riolu.ui.rendering import RenderSection
 from riolu.ui.screens import Screen, digest, error, source_options, sources
 from riolu.source import Source
@@ -13,6 +16,7 @@ from riolu.source_registry import SourceRegistry
 
 
 PAGE_SIZE = 10
+LOGGER = logging.getLogger(__name__)
 
 
 class NewsFeature:
@@ -76,9 +80,12 @@ class NewsFeature:
         selected = next((value for value in options if value[0] == mode), None)
         if selected is None:
             return error(f"Unknown {source.name} view", mode)
+        started = time.monotonic()
         try:
             items = await source.fetch_mode(mode, self._http_client())  # type: ignore[attr-defined]
         except Exception as exc:
+            LOGGER.warning("Source failed source=%s command=mode view=%s phase=fetch elapsed_ms=%.0f %s",
+                           source.id, mode, 1000 * (time.monotonic() - started), error_context(exc))
             return digest(
                 f"{source.name} - {selected[1]}",
                 (RenderSection(title="", error=str(exc)),),
@@ -103,9 +110,12 @@ class NewsFeature:
             return error(f"Unknown {source.name} category", category_id)
 
         limit = min(_limit(args[1:], self.settings), 10)
+        started = time.monotonic()
         try:
             items = await source.fetch_category(category_id, limit)  # type: ignore[attr-defined]
         except Exception as exc:
+            LOGGER.warning("Source failed source=%s command=category view=%s phase=fetch elapsed_ms=%.0f %s",
+                           source.id, category_id, 1000 * (time.monotonic() - started), error_context(exc))
             return digest(category[1], (RenderSection(title=category[1], error=str(exc)),))
         section = RenderSection(title=category[1], items=tuple(items))
         return digest(
@@ -145,9 +155,12 @@ class NewsFeature:
         return list(await asyncio.gather(*(self._fetch_section(source, limit) for source in sources)))
 
     async def _fetch_section(self, source: Source, limit: int) -> RenderSection:
+        started = time.monotonic()
         try:
             items = await source.fetch(limit, self._http_client())
         except Exception as exc:
+            LOGGER.warning("Source failed source=%s command=source phase=fetch elapsed_ms=%.0f %s",
+                           source.id, 1000 * (time.monotonic() - started), error_context(exc))
             return RenderSection(title=source.name, error=str(exc))
         return RenderSection(title=source.name, items=tuple(items))
 

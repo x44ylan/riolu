@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 import re
 import secrets
+import time
 from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -15,6 +16,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from riolu.config import Settings
+from riolu.diagnostics import error_context
 from riolu.features import DojoFeature, NewsFeature, NotesFeature
 from riolu.features.host import HostInspector
 from riolu.models import IntelItem
@@ -33,12 +35,20 @@ from riolu.webhook import HookServer, HandlerResult, validate_event, validate_me
 LOGGER = logging.getLogger(__name__)
 MAX_ARTIFACT_BYTES = 10_000_000
 AGENT_REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{8,48}$")
+
+
+class DigestIncompleteError(RuntimeError):
+    def __init__(self, sources: tuple[str, ...], chats: tuple[int, ...] = ()) -> None:
+        self.sources, self.chats = sources, chats
+        super().__init__(f"Daily digest incomplete: sources={','.join(sources) or '-'} chats={len(chats)}")
+
+
 BASE_BOT_COMMANDS: tuple[dict[str, str], ...] = (
     {"command": "start", "description": "Open the Riolu menu"},
     {"command": "latest", "description": "Choose a news source"},
     {"command": "note", "description": "Add a named note"},
     {"command": "notes", "description": "Open the notes vault"},
-    {"command": "dojo", "description": "System health and tools"},
+    {"command": "dojo", "description": "Open tool links"},
     {"command": "opencode", "description": "Start an OpenCode session topic"},
     {"command": "clear", "description": "Clear recent Riolu chat history"},
     {"command": "help", "description": "Show examples and help"},
@@ -314,7 +324,10 @@ class RioluBot:
         normalized = normalize_source_token(command)
         has_ctftime = self.registry.get("ctftime") is not None
         if normalized == "start":
-            screen = welcome(include_ctftime=has_ctftime)
+            screen = welcome(
+                snapshot=await self.dojo.inspector.overview(),
+                include_ctftime=has_ctftime,
+            )
         elif normalized == "clear":
             await self._clear_chat(chat_id)
             return
@@ -347,29 +360,41 @@ class RioluBot:
                 await self.store.remember_message(chat_id, message_id)
 
     async def _digest_loop(self) -> None:
+        failures = 0
+        retry_delay = None
         while True:
             try:
-                delay, catching_up = _digest_delay(
-                    datetime.now(ZoneInfo(self.settings.timezone)),
-                    await self.store.digest_last_date(),
-                    self.settings.daily_hour,
-                )
-                if catching_up:
-                    LOGGER.info("Daily news digest was missed; catching up in %.0f seconds", delay)
+                if retry_delay is not None:
+                    delay = retry_delay
                 else:
-                    LOGGER.info("Next daily news digest in %.0f seconds", delay)
+                    delay, catching_up = _digest_delay(
+                        datetime.now(ZoneInfo(self.settings.timezone)),
+                        await self.store.digest_last_date(),
+                        self.settings.daily_hour,
+                    )
+                    if catching_up:
+                        LOGGER.info("Daily news digest was missed; catching up in %.0f seconds", delay)
+                    else:
+                        LOGGER.info("Next daily news digest in %.0f seconds", delay)
                 await asyncio.sleep(delay)
-                await self._post_periodic_updates()
-                await self.store.save_digest_date(
-                    datetime.now(ZoneInfo(self.settings.timezone)).date().isoformat()
-                )
+                date = datetime.now(ZoneInfo(self.settings.timezone)).date().isoformat()
+                digest_id = f"{date}:{failures + 1}"
+                started = time.monotonic()
+                LOGGER.info("Digest started digest=%s attempt=%s", digest_id, failures + 1)
+                await self._post_periodic_updates(digest_id=digest_id)
+                await self.store.save_digest_date(date)
+                LOGGER.info("Digest completed digest=%s elapsed_ms=%.0f", digest_id, 1000 * (time.monotonic() - started))
+                failures, retry_delay = 0, None
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                LOGGER.exception("Daily news digest cycle failed")
-                await asyncio.sleep(60)
+            except Exception as exc:
+                failures += 1
+                retry_delay = min(3600, 60 * 2 ** min(failures - 1, 6))
+                sources = ",".join(exc.sources) if isinstance(exc, DigestIncompleteError) else "-"
+                LOGGER.warning("Digest failed attempt=%s sources=%s retry_in=%s %s",
+                               failures, sources, retry_delay, error_context(exc))
 
-    async def _post_periodic_updates(self) -> None:
+    async def _post_periodic_updates(self, *, digest_id: str = "manual") -> None:
         news_thread_id = self.settings.daily_news_thread_id
         if self.settings.daily_news_chat_id is not None:
             chat_ids = {self.settings.daily_news_chat_id}
@@ -380,6 +405,7 @@ class RioluBot:
             chat_ids = await self.store.known_chat_ids()
             news_thread_id = None
         failed_chats: list[int] = []
+        failed_sources: set[str] = set()
         resolved_chats = {await self.store.resolve_chat(chat_id) for chat_id in chat_ids}
         for chat_id in resolved_chats:
             if not await self._is_allowed(chat_id):
@@ -389,13 +415,17 @@ class RioluBot:
                     chat_id,
                     self.registry.automated_sources(self.settings.automated_source_ids),
                     message_thread_id=news_thread_id,
+                    digest_id=digest_id,
                 )
-            except Exception:
+            except Exception as exc:
                 # One broken chat must not starve the remaining digest targets.
                 failed_chats.append(chat_id)
-                LOGGER.exception("Daily digest failed for chat_id=%s; continuing", chat_id)
+                if isinstance(exc, DigestIncompleteError):
+                    failed_sources.update(exc.sources)
+                else:
+                    LOGGER.error("Digest chat failed digest=%s chat_id=%s %s", digest_id, chat_id, error_context(exc))
         if failed_chats:
-            raise RuntimeError(f"Daily digest incomplete for {len(failed_chats)} chat(s).")
+            raise DigestIncompleteError(tuple(sorted(failed_sources)), tuple(failed_chats))
 
     async def _post_new_items(
         self,
@@ -403,13 +433,16 @@ class RioluBot:
         sources: tuple[Source, ...],
         *,
         message_thread_id: int | None = None,
+        digest_id: str = "manual",
     ) -> None:
         failed_sources: list[str] = []
         for source in sources:
+            started = time.monotonic()
             try:
                 items = await source.fetch(self.settings.max_limit, self._http)
-            except Exception:
-                LOGGER.exception("Automated source failed: %s", source.id)
+            except Exception as exc:
+                LOGGER.warning("Source failed digest=%s source=%s chat_id=%s phase=fetch elapsed_ms=%.0f %s",
+                               digest_id, source.id, chat_id, 1000 * (time.monotonic() - started), error_context(exc))
                 failed_sources.append(source.id)
                 continue
 
@@ -419,6 +452,9 @@ class RioluBot:
                 if item.identity not in seen:
                     fresh.append(item)
                     seen.add(item.identity)
+            LOGGER.info("Source fetched digest=%s source=%s chat_id=%s fetched=%s fresh=%s elapsed_ms=%.0f",
+                        digest_id, source.id, chat_id, len(items), len(fresh), 1000 * (time.monotonic() - started))
+            delivered = 0
             try:
                 for batch in _update_batches(source.name, fresh):
                     await self._show(
@@ -430,15 +466,19 @@ class RioluBot:
                     await self.store.mark_seen(
                         chat_id, source.id, [item.identity for item in batch],
                     )
+                    delivered += len(batch)
+                if delivered:
+                    LOGGER.info("Source delivered digest=%s source=%s chat_id=%s items=%s", digest_id, source.id, chat_id, delivered)
             except ChatMigratedError:
                 raise
-            except Exception:
-                LOGGER.exception("Automated source delivery failed: %s", source.id)
+            except Exception as exc:
+                LOGGER.warning("Source failed digest=%s source=%s chat_id=%s phase=delivery delivered=%s elapsed_ms=%.0f %s",
+                               digest_id, source.id, chat_id, delivered, 1000 * (time.monotonic() - started), error_context(exc))
                 failed_sources.append(source.id)
 
         if failed_sources:
-            raise RuntimeError(f"Daily digest incomplete for sources: {', '.join(failed_sources)}")
-        LOGGER.info("Daily news ingest completed for chat_id=%s", chat_id)
+            raise DigestIncompleteError(tuple(failed_sources))
+        LOGGER.info("Daily news ingest completed digest=%s chat_id=%s", digest_id, chat_id)
 
     async def _is_allowed(self, chat_id: int) -> bool:
         if not self.settings.allowed_chat_ids or chat_id in self.settings.allowed_chat_ids:

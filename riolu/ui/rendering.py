@@ -25,8 +25,19 @@ class RenderSection:
     error: str = ""
 
 
-def render_welcome() -> str:
-    return "ℹ️ <b>Riolu</b>\n<i>Personal assistance.</i>"
+def render_welcome(snapshot: HostSnapshot | None = None) -> str:
+    if snapshot is None:
+        return "ℹ️ <b>Riolu</b>\n<i>Personal assistance.</i>"
+    return (
+        "ℹ️ <b>Riolu</b>\n"
+        "<blockquote>"
+        f"<b>{escape(snapshot.hostname)}</b>\n"
+        f"Uptime · {_duration(snapshot.uptime_seconds)}\n"
+        f"Load · {snapshot.load_1m:.2f} / {snapshot.cpu_count} cores\n"
+        f"Memory · {_usage(snapshot.memory_used, snapshot.memory_total)}\n"
+        f"Disk · {_usage(snapshot.disk_used, snapshot.disk_total)}"
+        "</blockquote>"
+    )
 
 
 def render_help(*, include_ctftime: bool = False) -> str:
@@ -35,7 +46,7 @@ def render_help(*, include_ctftime: bool = False) -> str:
         lines.append("/ctftime — ongoing and upcoming CTFs")
     lines.extend((
         "/note  /notes — notes",
-        "/dojo — server",
+        "/dojo — links",
         "/opencode — coding sessions",
         "/clear — clear recent chat messages",
     ))
@@ -54,15 +65,7 @@ def render_loading(label: str) -> str:
 
 
 def render_dojo_overview(snapshot: HostSnapshot) -> str:
-    return (
-        f"💻 <b>{escape(snapshot.hostname)}</b>\n"
-        "<blockquote>"
-        f"Uptime · {_duration(snapshot.uptime_seconds)}\n"
-        f"Load · {snapshot.load_1m:.2f} / {snapshot.cpu_count} cores\n"
-        f"Memory · {_usage(snapshot.memory_used, snapshot.memory_total)}\n"
-        f"Disk · {_usage(snapshot.disk_used, snapshot.disk_total)}"
-        "</blockquote>"
-    )
+    return "🔗 <b>Links</b>\n<i>Quick links</i>"
 
 
 def render_dojo_tailscale(peers: tuple[TailscalePeer, ...]) -> str:
@@ -188,13 +191,13 @@ def event_markup(url: str) -> ReplyMarkup | None:
 
 
 def main_menu_markup(*, include_ctftime: bool = False) -> ReplyMarkup:
-    rows = []
+    rows = [(("↻", "nav:start"),)]
     if include_ctftime:
         rows.append((("CTFtime", "run:ctftime"),))
     rows.extend((
         (("News", "nav:sources"),),
         (("Notes", "nav:notes"),),
-        (("Dojo", "nav:dojo"),),
+        (("Links", "nav:dojo"),),
     ))
     return _inline_keyboard(*rows)
 

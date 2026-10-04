@@ -37,9 +37,9 @@ class Screen:
     markup: ReplyMarkup | None = None
 
 
-def welcome(*, include_ctftime: bool = False) -> Screen:
+def welcome(*, snapshot: HostSnapshot | None = None, include_ctftime: bool = False) -> Screen:
     return Screen(
-        render_welcome(),
+        render_welcome(snapshot),
         main_menu_markup(include_ctftime=include_ctftime),
     )
 
@@ -73,9 +73,7 @@ def source_options(
 
 
 def dojo_overview(snapshot: HostSnapshot) -> Screen:
-    rows: list[list[dict[str, str]]] = [
-        [{"text": "↻", "callback_data": "dojo:refresh"}]
-    ]
+    rows: list[list[dict[str, str]]] = []
     tool_buttons = [
         {"text": tool.name.casefold(), "url": tool.url}
         for tool in sorted(snapshot.tools, key=lambda value: value.name.casefold())
@@ -94,7 +92,7 @@ def dojo_tailscale(peers: tuple[TailscalePeer, ...]) -> Screen:
         render_dojo_tailscale(peers),
         _keyboard(
             (("↻", "dojo:tailscale"),),
-            (("‹ Dojo", "nav:dojo"),),
+            (("‹ Links", "nav:dojo"),),
         ),
     )
 
