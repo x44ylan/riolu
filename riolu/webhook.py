@@ -102,7 +102,7 @@ class HookServer:
         return self._server
 
     async def run(self) -> None:
-        server = await self.start()
+        server = self._server if self._server is not None else await self.start()
         async with server:
             await server.serve_forever()
 

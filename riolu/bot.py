@@ -92,33 +92,47 @@ class RioluBot:
             self.telegram = TelegramAPI(self.settings.telegram_token, client)
             await self._configure_telegram()
 
-            tasks = {
-                asyncio.create_task(self._digest_loop()),
-                asyncio.create_task(self.harness.refresh_panels()),
-                asyncio.create_task(self.harness.sync_names()),
-                asyncio.create_task(self.harness.watch_requests()),
-            }
-            if self.settings.hook_token or self.settings.mcp_token:
-                server = HookServer(
-                    self.settings.hook_host,
-                    self.settings.hook_port,
-                    self.settings.hook_token,
-                    self._handle_hook,
-                    message_token=self.settings.mcp_token,
-                    message_handler=self._handle_agent_message,
-                    agent_handler=self._handle_agent_action,
-                )
-                tasks.add(asyncio.create_task(server.run()))
-                LOGGER.info("Local integration endpoint enabled on %s:%s", self.settings.hook_host, server.port)
-            for task in tasks:
-                task.add_done_callback(_log_background_failure)
-
+            tasks = set()
+            server = None
             try:
-                await self._poll_forever()
+                listener = None
+                if self.settings.hook_token or self.settings.mcp_token:
+                    server = HookServer(
+                        self.settings.hook_host,
+                        self.settings.hook_port,
+                        self.settings.hook_token,
+                        self._handle_hook,
+                        message_token=self.settings.mcp_token,
+                        message_handler=self._handle_agent_message,
+                        agent_handler=self._handle_agent_action,
+                    )
+                    await server.start()
+                    listener = asyncio.create_task(server.run())
+                    tasks.add(listener)
+                    LOGGER.info("Local integration endpoint ready on %s:%s", self.settings.hook_host, server.port)
+                tasks.update({
+                    asyncio.create_task(self._digest_loop()),
+                    asyncio.create_task(self.harness.refresh_panels()),
+                    asyncio.create_task(self.harness.sync_names()),
+                    asyncio.create_task(self.harness.watch_requests()),
+                })
+                for task in tasks:
+                    if task is not listener:
+                        task.add_done_callback(_log_background_failure)
+                polling = asyncio.create_task(self._poll_forever())
+                tasks.add(polling)
+                if listener is not None:
+                    done, _ = await asyncio.wait({polling, listener}, return_when=asyncio.FIRST_COMPLETED)
+                    if listener in done:
+                        await listener
+                        raise RuntimeError("Required local integration listener stopped unexpectedly")
+                await polling
             finally:
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+                if server is not None:
+                    await server.close()
                 await self.harness.close()
                 self.telegram = None
                 self.http = None
