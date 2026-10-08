@@ -27,9 +27,8 @@ class RenderSection:
 
 def render_welcome(snapshot: HostSnapshot | None = None) -> str:
     if snapshot is None:
-        return "ℹ️ <b>Riolu</b>\n<i>Personal assistance.</i>"
+        return "<i>Personal assistance.</i>"
     return (
-        "ℹ️ <b>Riolu</b>\n"
         "<blockquote>"
         f"<b>{escape(snapshot.hostname)}</b>\n"
         f"Uptime · {_duration(snapshot.uptime_seconds)}\n"
@@ -65,7 +64,7 @@ def render_loading(label: str) -> str:
 
 
 def render_dojo_overview(snapshot: HostSnapshot) -> str:
-    return "🔗 <b>Links</b>\n<i>Quick links</i>"
+    return "\u00a0" * 12 + "🔗 <b>Links</b>" + "\u00a0" * 12
 
 
 def render_dojo_tailscale(peers: tuple[TailscalePeer, ...]) -> str:

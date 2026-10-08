@@ -24,6 +24,8 @@ and duplicate defaults. Telegram boundaries include explicit rate limits and
 harmless repeated edits; artifacts include sensitive aliases and invalid sizes.
 Digest outage cases: retry storms, duplicate healthy-source delivery, premature
 completion, missing failure context, and secrets exposed in diagnostic output.
+OpenCode startup cases: a temporarily empty default catalog, lasting absence,
+duplicate prompt admission, and replacing an explicitly selected model.
 All Telegram traffic and source traffic stays on disposable loopback servers.
 No production settings, state, Telegram chats, or OpenCode sessions are used.
 Run with Riolu's Python environment; RIOLU_E2E_REPORT selects the JSON artifact.
@@ -451,10 +453,12 @@ async def main():
                 value.dojo.inspector.tools = (
                     DojoToolConfig('Zulu', 'systemd', 'riolu-e2e-missing.service', url=services.url + '/zulu'),
                     DojoToolConfig('Alpha', 'systemd', 'riolu-e2e-missing.service', url=services.url + '/alpha'),
+                    DojoToolConfig('Middle', 'systemd', 'riolu-e2e-missing.service', url=services.url + '/middle'),
                 )
                 await update(value, "/start")
                 home = services.sent[-1][1]
-                assert all(label in home['text'] for label in ('<b>Riolu</b>', 'Uptime', 'Load', 'Memory', 'Disk')), home
+                assert all(label in home['text'] for label in ('Uptime', 'Load', 'Memory', 'Disk')), home
+                assert home['text'].startswith('<blockquote>'), home
                 menu = services.sent[-1][1]['reply_markup']['inline_keyboard']
                 assert any(button['text'] == 'Links' and button.get('callback_data') == 'nav:dojo' for row in menu for button in row), menu
                 assert not any(button['text'] == 'Dojo' for row in menu for button in row), menu
@@ -467,10 +471,11 @@ async def main():
                 await callback(value, 'nav:dojo')
                 method, payload = services.calls[-1]
                 assert method == 'editMessageText' and '<b>Links</b>' in payload['text'], payload
-                assert 'Quick links' in payload['text'], payload
+                assert payload['text'] == '\u00a0' * 12 + '🔗 <b>Links</b>' + '\u00a0' * 12, payload
                 assert not any(label in payload['text'] for label in ('Uptime', 'Load', 'Memory', 'Disk')), payload
                 buttons = [button for row in payload['reply_markup']['inline_keyboard'] for button in row]
-                assert [(button['text'], button['url']) for button in buttons if 'url' in button] == [('alpha', services.url + '/alpha'), ('zulu', services.url + '/zulu')], buttons
+                assert [(button['text'], button['url']) for button in buttons if 'url' in button] == [('alpha', services.url + '/alpha'), ('middle', services.url + '/middle'), ('zulu', services.url + '/zulu')], buttons
+                assert [len(row) for row in payload['reply_markup']['inline_keyboard']] == [1, 1, 1, 1], payload
                 assert not any(button.get('callback_data') == 'dojo:refresh' or button['text'] in ('↻', 'Reset') for button in buttons), buttons
                 await callback(value, 'nav:start')
                 assert all(label in services.calls[-1][1]['text'] for label in ('Uptime', 'Load', 'Memory', 'Disk'))
@@ -480,7 +485,7 @@ async def main():
                 await callback(value, "dojo:refresh")
                 assert services.calls[-1][0] == "editMessageText" and '<b>Links</b>' in services.calls[-1][1]['text']
 
-            await check("home_stats_refresh_and_links_description_preserve_tool_links_and_navigation", host_menu)
+            await check("home_stats_refresh_and_links_layout_preserve_tool_links_and_navigation", host_menu)
 
             async def mcp_bridge(value, post, *, worker_override=False):
                 from riolu.agent import mcp as delivery
@@ -947,6 +952,76 @@ async def main():
                 assert status != 0 and "enabled" in failure
 
             await check("configuration_normalizes_source_ids_and_validates_overrides", config_overrides)
+
+            async def default_model_readiness(mode):
+                from riolu.agent.worker import AgentWorker
+                value = bot()
+                worker = AgentWorker(replace(value.settings, agent_port=0, agent_token="worker-test",
+                                             opencode_url=services.url, opencode_password="", opencode_password_file=""))
+                await worker.server.start()
+                default = {"providerID": "fixture", "id": "default", "variants": [],
+                           "settings": {"apiKey": "fixture-private-key"}}
+                explicit = {"providerID": "fixture", "id": "selected", "variants": []}
+                counts = {"default": 0, "catalog": 0, "model_writes": 0, "prompt_writes": 0}
+                native = {"id": "ses_fixture", "model": None}
+                records = []
+                class Capture(logging.Handler):
+                    def emit(self, record):
+                        records.append(record.getMessage())
+                logger = logging.getLogger("riolu.agent.opencode")
+                handler = Capture()
+                old_level = logger.level
+                logger.setLevel(logging.INFO)
+                logger.addHandler(handler)
+                async def handle_native(method, path, body):
+                    if method == "GET" and path == "/api/session/ses_fixture":
+                        return 200, {"data": native}
+                    if method == "GET" and path == "/api/model/default":
+                        counts["default"] += 1
+                        missing = mode == "missing" or (mode == "recover" and counts["default"] < 3)
+                        return 200, {"data": None if missing else default}
+                    if method == "GET" and path == "/api/model":
+                        counts["catalog"] += 1
+                        return 200, {"data": [default, explicit]}
+                    if method == "POST" and path == "/api/session/ses_fixture/model":
+                        counts["model_writes"] += 1
+                        native["model"] = body["model"]
+                        return 200, {"data": native}
+                    if method == "POST" and path == "/api/session/ses_fixture/prompt":
+                        counts["prompt_writes"] += 1
+                        return 200, {"data": {"id": "message-fixture", "type": "user", "text": body["text"]}}
+                    return 404, {"message": "fixture unexpected path"}
+                services.native_handler = handle_native
+                try:
+                    selected = "fixture/selected" if mode == "explicit" else "fixture/missing" if mode == "explicit_missing" else "default"
+                    response = await http.post(
+                        f"http://127.0.0.1:{worker.server.port}/opencode",
+                        headers={"Authorization": "Bearer worker-test"},
+                        json={"thread": {"cwd": root, "model": selected}, "method": "POST",
+                              "path": "/session/ses_fixture/admit", "body": {"parts": [{"type": "text", "text": "fixture startup prompt"}]}},
+                    )
+                    if mode in {"missing", "explicit_missing"}:
+                        assert response.status_code == 409 and response.json()["code"] == "model_unavailable", response.status_code
+                        assert counts["prompt_writes"] == counts["model_writes"] == 0, counts
+                    else:
+                        assert response.status_code == 200, response.status_code
+                        assert counts["prompt_writes"] == counts["model_writes"] == 1, counts
+                        assert native["model"] == {"providerID": "fixture", "id": "selected" if mode == "explicit" else "default"}
+                    assert counts["default"] == (0 if mode.startswith("explicit") else 3), counts
+                    if mode in {"recover", "missing"}:
+                        assert len([line for line in records if "Default model not ready" in line]) == 2, records
+                    assert "fixture-private-key" not in "\n".join(records), records
+                finally:
+                    services.native_handler = None
+                    logger.removeHandler(handler)
+                    logger.setLevel(old_level)
+                    await worker.server.close()
+                    await worker.http.aclose()
+
+            await check("opencode_default_catalog_startup_gap_recovers_before_single_admission", lambda: default_model_readiness("recover"))
+            await check("opencode_default_absence_is_bounded_and_never_admits", lambda: default_model_readiness("missing"))
+            await check("opencode_explicit_model_is_preserved_without_default_lookup", lambda: default_model_readiness("explicit"))
+            await check("opencode_unavailable_explicit_model_never_falls_back", lambda: default_model_readiness("explicit_missing"))
 
             async def coding_controls():
                 from riolu.agent.harness import HarnessChat

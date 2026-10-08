@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 import time
 from urllib.parse import quote
@@ -15,6 +16,7 @@ from riolu.agent.errors import OpenCodeError, failure_reason
 
 RUN_POLL_SECONDS = 2
 RUN_TIMEOUT_SECONDS = 60 * 60
+LOGGER = logging.getLogger(__name__)
 
 
 class OpenCodeV2:
@@ -85,7 +87,16 @@ class OpenCodeV2:
         elif selected:
             selected = {**selected, "id": selected.get("id", selected.get("modelID"))}
         if not selected:
-            selected = await self.raw(thread, "GET", "/api/model/default")
+            # Location plugins populate the default catalog asynchronously.
+            # Retry only this read; prompt admission still happens once.
+            for attempt in range(3):
+                selected = await self.raw(thread, "GET", "/api/model/default")
+                if selected or attempt == 2:
+                    break
+                delay = 0.5 * (attempt + 1)
+                LOGGER.info("Default model not ready cwd=%s attempt=%s retry_in=%.1f",
+                            thread["cwd"], attempt + 1, delay)
+                await asyncio.sleep(delay)
         if not selected:
             raise OpenCodeError("No model is available. Use /model to choose a connected model.", code="model_unavailable", status=409)
         for attempt in range(3):
